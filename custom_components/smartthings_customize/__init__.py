@@ -15,8 +15,9 @@ from .pysmartthings import Attribute, Capability, SmartThings
 from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
 from homeassistant.const import CONF_ACCESS_TOKEN, CONF_CLIENT_ID, CONF_CLIENT_SECRET, SERVICE_RELOAD
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import config_entry_oauth2_flow
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.dispatcher import (
     async_dispatcher_connect,
@@ -120,23 +121,51 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Initialize config entry which represents an installed SmartApp."""
     entry.update_listeners.clear()
 
+    # Check if manual mode or OAuth2 mode
+    manual_mode = entry.data.get(CONF_MANUAL_MODE, False)
+
+    # Get access token based on mode
+    if manual_mode:
+        # Manual mode: use access token directly
+        access_token = entry.data[CONF_ACCESS_TOKEN]
+    else:
+        # OAuth2 mode: use OAuth2 session for token management
+        try:
+            implementation = await config_entry_oauth2_flow.async_get_config_entry_implementation(
+                hass, entry
+            )
+        except ValueError as err:
+            _LOGGER.error("OAuth2 implementation not found: %s", err)
+            raise ConfigEntryNotReady from err
+
+        oauth_session = config_entry_oauth2_flow.OAuth2Session(hass, entry, implementation)
+
+        try:
+            await oauth_session.async_ensure_token_valid()
+        except Exception as err:
+            _LOGGER.error("Token refresh failed: %s", err)
+            raise ConfigEntryAuthFailed from err
+
+        access_token = oauth_session.token[CONF_ACCESS_TOKEN]
+
     # For backwards compat
-    if entry.unique_id is None:
+    if entry.unique_id is None and not manual_mode:
         hass.config_entries.async_update_entry(
             entry,
             unique_id=format_unique_id(
-                entry.data[CONF_APP_ID], entry.data[CONF_LOCATION_ID]
+                entry.data.get(CONF_APP_ID, "unknown"), entry.data[CONF_LOCATION_ID]
             ),
         )
 
-    if not validate_webhook_requirements(hass):
+    # Skip webhook validation if in manual mode
+    if not manual_mode and not validate_webhook_requirements(hass):
         _LOGGER.warning(
             "The 'base_url' of the 'http' integration must be configured and start with"
             " 'https://'"
         )
         return False
 
-    api = SmartThings_custom(async_get_clientsession(hass), entry.data[CONF_ACCESS_TOKEN])
+    api = SmartThings_custom(async_get_clientsession(hass), access_token)
 
     # Ensure platform modules are loaded since the DeviceBroker will
     # import them below and we want them to be cached ahead of time
@@ -151,19 +180,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     remove_entry = False
 
-    app = await async_get_app_info(hass, entry.data[CONF_APP_ID], entry.data[CONF_ACCESS_TOKEN])
-    
-    try:
-        # See if the app is already setup. This occurs when there are
-        # installs in multiple SmartThings locations (valid use-case)
-        manager = hass.data[DOMAIN][DATA_MANAGER]
-        smart_app = manager.smartapps.get(entry.data[CONF_APP_ID])
-        if not smart_app:
-            # Validate and setup the app.
-            #app = await api.app(entry.data[CONF_APP_ID])
-            smart_app = setup_smartapp(hass, app)
+    # Setup SmartApp (only for manual mode with app_id)
+    smart_app = None
+    if manual_mode and CONF_APP_ID in entry.data:
+        app = await async_get_app_info(hass, entry.data[CONF_APP_ID], access_token)
 
-        # Validate and retrieve the installed app.
+        try:
+            # See if the app is already setup
+            manager = hass.data[DOMAIN][DATA_MANAGER]
+            smart_app = manager.smartapps.get(entry.data[CONF_APP_ID])
+            if not smart_app:
+                smart_app = setup_smartapp(hass, app)
+        except Exception:
+            _LOGGER.warning("Failed to setup smartapp, continuing without it")
+
+    try:
+        # Validate and retrieve the installed app
         installed_app = await validate_installed_app(
             api, entry.data[CONF_INSTALLED_APP_ID]
         )
@@ -171,20 +203,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # Get scenes
         scenes = await async_get_entry_scenes(entry, api)
 
-        # Get SmartApp token to sync subscriptions
-        token = await api.generate_tokens(
-            entry.data[CONF_CLIENT_ID],
-            entry.data[CONF_CLIENT_SECRET],
-            entry.data[CONF_REFRESH_TOKEN],
-        )
-        hass.config_entries.async_update_entry(
-            entry, data={**entry.data, 
-            CONF_ACCESS_TOKEN: token.access_token,
-            CONF_REFRESH_TOKEN: token.refresh_token
-            }
-        )
-
-        api = SmartThings_custom(async_get_clientsession(hass), entry.data[CONF_ACCESS_TOKEN])
+        # Token refresh for manual mode only
+        if manual_mode and CONF_CLIENT_ID in entry.data:
+            try:
+                token = await api.generate_tokens(
+                    entry.data[CONF_CLIENT_ID],
+                    entry.data[CONF_CLIENT_SECRET],
+                    entry.data[CONF_REFRESH_TOKEN],
+                )
+                hass.config_entries.async_update_entry(
+                    entry, data={**entry.data,
+                    CONF_ACCESS_TOKEN: token.access_token,
+                    CONF_REFRESH_TOKEN: token.refresh_token
+                    }
+                )
+                access_token = token.access_token
+                api = SmartThings_custom(async_get_clientsession(hass), access_token)
+            except Exception:
+                _LOGGER.warning("Token refresh failed in manual mode, continuing with existing token")
 
         # Get devices and their current status
         devices = await api.devices(location_ids=[installed_app.location_id])
@@ -206,14 +242,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         await asyncio.gather(*(retrieve_device_status(d) for d in devices.copy()))
 
-        # Sync device subscriptions
-        await smartapp_sync_subscriptions(
-            hass,
-            token.access_token,
-            installed_app.location_id,
-            installed_app.installed_app_id,
-            devices,
-        )
+        # Sync device subscriptions (skip if in manual mode)
+        if not manual_mode:
+            await smartapp_sync_subscriptions(
+                hass,
+                token.access_token,
+                installed_app.location_id,
+                installed_app.installed_app_id,
+                devices,
+            )
+        else:
+            _LOGGER.info(
+                "Manual mode enabled - skipping webhook subscriptions for app '%s'",
+                installed_app.installed_app_id,
+            )
 
         # Setup device broker
         #broker = DeviceBroker(hass, entry, token, smart_app, devices, scenes)

@@ -39,12 +39,11 @@ class format_util(string.Template):
 class SmartThingsEntity_custom(Entity):
     """Defines a SmartThings entity."""
 
-    _attr_should_poll = False
-
     def __init__(self, hass, platform: Platform, setting) -> None:
         """Initialize the instance."""
         self._hass = hass
         self._device = setting[0]
+        self._use_polling = None  # Will be determined dynamically
 
         component = setting[1].get(CONF_COMPONENT)
         capability = setting[1].get(CONF_CAPABILITY)
@@ -152,6 +151,31 @@ class SmartThingsEntity_custom(Entity):
     @property
     def extra_state_attributes(self):
         return self._extra_state_attributes
+
+    @property
+    def should_poll(self) -> bool:
+        """Return True if entity has to be polled for state."""
+        if self._use_polling is None:
+            # Determine polling mode from config entry
+            for entry in self._hass.config_entries.async_entries(DOMAIN):
+                if entry.data.get(CONF_LOCATION_ID):
+                    self._use_polling = entry.data.get(CONF_USE_POLLING, False)
+                    break
+            if self._use_polling is None:
+                self._use_polling = False
+        return self._use_polling
+
+    async def async_update(self) -> None:
+        """Update the entity status."""
+        if self.should_poll:
+            try:
+                await self._device.status.refresh()
+            except Exception as ex:
+                _LOGGER.error(
+                    "Error updating device %s: %s",
+                    self._device.label,
+                    ex,
+                )
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -551,12 +575,11 @@ class SettingManager(object):
 class SmartThingsEntity(Entity):
     """Defines a SmartThings entity."""
 
-    _attr_should_poll = False
-
     def __init__(self, device: DeviceEntity) -> None:
         """Initialize the instance."""
         self._device = device
         self._dispatcher_remove = None
+        self._use_polling = None  # Will be determined dynamically
 
     async def async_added_to_hass(self):
         """Device added to hass."""
@@ -597,3 +620,28 @@ class SmartThingsEntity(Entity):
     def unique_id(self) -> str:
         """Return a unique ID."""
         return self._device.device_id
+
+    @property
+    def should_poll(self) -> bool:
+        """Return True if entity has to be polled for state."""
+        if self._use_polling is None:
+            # Determine polling mode from config entry
+            for entry in self.hass.config_entries.async_entries(DOMAIN):
+                if entry.data.get(CONF_LOCATION_ID):
+                    self._use_polling = entry.data.get(CONF_USE_POLLING, False)
+                    break
+            if self._use_polling is None:
+                self._use_polling = False
+        return self._use_polling
+
+    async def async_update(self) -> None:
+        """Update the entity status."""
+        if self.should_poll:
+            try:
+                await self._device.status.refresh()
+            except Exception as ex:
+                _LOGGER.error(
+                    "Error updating device %s: %s",
+                    self._device.label,
+                    ex,
+                )

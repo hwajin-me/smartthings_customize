@@ -10,12 +10,34 @@ APP_OAUTH_CLIENT_NAME = "HA Customize"
 APP_OAUTH_SCOPES = ["r:devices:*", "r:devices:*","w:devices:*","x:devices:*","l:devices","r:locations:*", "w:locations:*", "x:locations:*","r:scenes:*", "x:scenes:*", "r:installedapps:*", "l:installedapps", "w:installedapps"]
 APP_NAME_PREFIX = "ha_customize."
 
+# OAuth2 Scopes for user authentication
+OAUTH2_AUTHORIZE = "https://api.smartthings.com/oauth/authorize"
+OAUTH2_TOKEN = "https://auth-global.api.smartthings.com/oauth/token"
+
+# Requested OAuth2 scopes
+REQUESTED_SCOPES = [
+    "r:devices:*",
+    "w:devices:*",
+    "x:devices:*",
+    "l:devices",
+    "r:locations:*",
+    "w:locations:*",
+    "x:locations:*",
+    "r:scenes:*",
+    "x:scenes:*",
+    "r:installedapps:*",
+    "l:installedapps",
+    "w:installedapps",
+]
+
 CONF_APP_ID = "app_id"
 CONF_CLOUDHOOK_URL = "cloudhook_url"
 CONF_INSTALLED_APP_ID = "installed_app_id"
 CONF_INSTANCE_ID = "instance_id"
 CONF_LOCATION_ID = "location_id"
 CONF_REFRESH_TOKEN = "refresh_token"
+CONF_MANUAL_MODE = "manual_mode"
+CONF_USE_POLLING = "use_polling"
 
 CONF_RESETTING_ENTITIES = "resetting_entities"
 #CONF_ENABLE_DEFAULT_ENTITIES = "enable_default_entities"
@@ -99,6 +121,7 @@ IGNORED_CAPABILITIES = [
 ]
 
 TOKEN_REFRESH_INTERVAL = timedelta(hours=12)
+POLLING_INTERVAL = timedelta(seconds=30)  # Default polling interval for manual mode
 
 VAL_UID = "^(?:([0-9a-fA-F]{32})|([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}))$"
 VAL_UID_MATCHER = re.compile(VAL_UID)

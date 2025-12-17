@@ -6,305 +6,279 @@ import logging
 from typing import Any
 
 from aiohttp import ClientResponseError
-from .pysmartthings import APIResponseError, AppOAuth, SmartThings
-from .pysmartthings.installedapp import format_install_url
+from .pysmartthings import APIResponseError, SmartThings
 import voluptuous as vol
 
-from homeassistant.config_entries import SOURCE_REAUTH, ConfigFlow, ConfigFlowResult, OptionsFlow
-from homeassistant.const import CONF_ACCESS_TOKEN, CONF_CLIENT_ID, CONF_CLIENT_SECRET
+from homeassistant.config_entries import (
+    SOURCE_REAUTH,
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
+from homeassistant.const import CONF_ACCESS_TOKEN
+from homeassistant.helpers import config_entry_oauth2_flow
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-
 import homeassistant.helpers.config_validation as cv
 from homeassistant.core import callback
 
 from .const import (
-    APP_OAUTH_CLIENT_NAME,
-    APP_OAUTH_SCOPES,
-    CONF_APP_ID,
     CONF_INSTALLED_APP_ID,
     CONF_LOCATION_ID,
-    CONF_REFRESH_TOKEN,
+    CONF_MANUAL_MODE,
+    CONF_USE_POLLING,
     DOMAIN,
-    VAL_UID_MATCHER,
-    #CONF_ENABLE_DEFAULT_ENTITIES,
+    REQUESTED_SCOPES,
     CONF_RESETTING_ENTITIES,
     CONF_ENABLE_SYNTAX_PROPERTY,
 )
 from .smartapp import (
-    create_app,
-    find_app,
     format_unique_id,
-    get_webhook_url,
-    setup_smartapp,
     setup_smartapp_endpoint,
-    update_app,
     validate_webhook_requirements,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
 
-class SmartThingsFlowHandler(ConfigFlow, domain=DOMAIN):
+class SmartThingsFlowHandler(
+    config_entry_oauth2_flow.AbstractOAuth2FlowHandler, domain=DOMAIN
+):
     """Handle configuration of SmartThings integrations."""
 
     VERSION = 2
+    DOMAIN = DOMAIN
 
-    api: SmartThings
-    app_id: str
     location_id: str
+    manual_mode: bool = False
 
     def __init__(self) -> None:
         """Create a new instance of the flow handler."""
-        self.access_token: str | None = None
-        self.oauth_client_secret = None
-        self.oauth_client_id = None
-        self.installed_app_id = None
-        self.refresh_token = None
+        super().__init__()
         self.endpoints_initialized = False
 
-    async def async_step_import(self, user_input=None):
-        """Occurs when a previously entry setup fails and is re-initiated."""
-        return await self.async_step_user(user_input)
+    @property
+    def logger(self) -> logging.Logger:
+        """Return logger."""
+        return _LOGGER
+
+    @property
+    def extra_authorize_data(self) -> dict[str, Any]:
+        """Extra data that needs to be appended to the authorize url."""
+        return {"scope": " ".join(REQUESTED_SCOPES)}
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Validate and confirm webhook setup."""
+        """Handle a flow initialized by the user."""
         if not self.endpoints_initialized:
             self.endpoints_initialized = True
             await setup_smartapp_endpoint(
                 self.hass, len(self._async_current_entries()) == 0
             )
-        webhook_url = get_webhook_url(self.hass)
 
-        # Abort if the webhook is invalid
-        if not validate_webhook_requirements(self.hass):
-            return self.async_abort(
-                reason="invalid_webhook_url",
-                description_placeholders={
-                    "webhook_url": webhook_url,
-                    "component_url": (
-                        "https://www.home-assistant.io/integrations/smartthings/"
-                    ),
-                },
-            )
+        # Check if webhook is available for automatic mode
+        has_webhook = validate_webhook_requirements(self.hass)
 
-        # Show the confirmation
-        if user_input is None:
-            return self.async_show_form(
-                step_id="user",
-                description_placeholders={"webhook_url": webhook_url},
-            )
+        if user_input is not None:
+            if user_input.get("auth_method") == "manual":
+                self.manual_mode = True
+                return await self.async_step_manual_auth()
+            # Continue with OAuth2 flow
+            return await self.async_step_pick_implementation()
 
-        # Show the next screen
-        return await self.async_step_pat()
-
-    async def async_step_pat(
-        self, user_input: dict[str, str] | None = None
-    ) -> ConfigFlowResult:
-        """Get the Personal Access Token and validate it."""
-        errors: dict[str, str] = {}
-        if user_input is None or CONF_ACCESS_TOKEN not in user_input:
-            return self._show_step_pat(errors)
-
-        self.access_token = user_input[CONF_ACCESS_TOKEN]
-
-        # Ensure token is a UUID
-        if not VAL_UID_MATCHER.match(self.access_token):
-            errors[CONF_ACCESS_TOKEN] = "token_invalid_format"
-            return self._show_step_pat(errors)
-
-        # Setup end-point
-        self.api = SmartThings(async_get_clientsession(self.hass), self.access_token)
-        try:
-            app = await find_app(self.hass, self.api)
-            if app:
-                await app.refresh()  # load all attributes
-                await update_app(self.hass, app)
-                # Find an existing entry to copy the oauth client
-                existing = next(
-                    (
-                        entry
-                        for entry in self._async_current_entries()
-                        if entry.data[CONF_APP_ID] == app.app_id
-                    ),
-                    None,
+        # Show choice between OAuth2 and manual
+        data_schema = vol.Schema(
+            {
+                vol.Required("auth_method", default="oauth2"): vol.In(
+                    {
+                        "oauth2": "OAuth2 (Recommended)",
+                        "manual": "Manual (for restricted networks)",
+                    }
                 )
-                if existing:
-                    self.oauth_client_id = existing.data[CONF_CLIENT_ID]
-                    self.oauth_client_secret = existing.data[CONF_CLIENT_SECRET]
-                else:
-                    # Get oauth client id/secret by regenerating it
-                    app_oauth = AppOAuth(app.app_id)
-                    app_oauth.client_name = APP_OAUTH_CLIENT_NAME
-                    app_oauth.scope.extend(APP_OAUTH_SCOPES)
-                    client = await self.api.generate_app_oauth(app_oauth)
-                    self.oauth_client_secret = client.client_secret
-                    self.oauth_client_id = client.client_id
-            else:
-                app, client = await create_app(self.hass, self.api)
-                self.oauth_client_secret = client.client_secret
-                self.oauth_client_id = client.client_id
-            setup_smartapp(self.hass, app)
-            self.app_id = app.app_id
-
-        except APIResponseError as ex:
-            if ex.is_target_error():
-                errors["base"] = "webhook_error"
-            else:
-                errors["base"] = "app_setup_error"
-            _LOGGER.exception(
-                "API error setting up the SmartApp: %s", ex.raw_error_response
-            )
-            return self._show_step_pat(errors)
-        except ClientResponseError as ex:
-            if ex.status == HTTPStatus.UNAUTHORIZED:
-                errors[CONF_ACCESS_TOKEN] = "token_unauthorized"
-                _LOGGER.debug(
-                    "Unauthorized error received setting up SmartApp", exc_info=True
-                )
-            elif ex.status == HTTPStatus.FORBIDDEN:
-                errors[CONF_ACCESS_TOKEN] = "token_forbidden"
-                _LOGGER.debug(
-                    "Forbidden error received setting up SmartApp", exc_info=True
-                )
-            else:
-                errors["base"] = "app_setup_error"
-                _LOGGER.exception("Unexpected error setting up the SmartApp")
-            return self._show_step_pat(errors)
-        except Exception:
-            errors["base"] = "app_setup_error"
-            _LOGGER.exception("Unexpected error setting up the SmartApp")
-            return self._show_step_pat(errors)
-
-        return await self.async_step_select_location()
-
-    async def async_step_select_location(
-        self, user_input: dict[str, str] | None = None
-    ) -> ConfigFlowResult:
-        """Ask user to select the location to setup."""
-        if user_input is None or CONF_LOCATION_ID not in user_input:
-            # Get available locations
-            existing_locations = [
-                entry.data[CONF_LOCATION_ID] for entry in self._async_current_entries()
-            ]
-            locations = await self.api.locations()
-            locations_options = {
-                location.location_id: location.name
-                for location in locations
-                if location.location_id not in existing_locations
             }
-            if not locations_options:
-                return self.async_abort(reason="no_available_locations")
-
-            return self.async_show_form(
-                step_id="select_location",
-                data_schema=vol.Schema(
-                    {vol.Required(CONF_LOCATION_ID): vol.In(locations_options)}
-                ),
-            )
-
-        self.location_id = user_input[CONF_LOCATION_ID]
-        await self.async_set_unique_id(format_unique_id(self.app_id, self.location_id))
-        return await self.async_step_authorize()
-
-    async def async_step_authorize(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """Wait for the user to authorize the app installation."""
-        user_input = {} if user_input is None else user_input
-        self.installed_app_id = user_input.get(CONF_INSTALLED_APP_ID)
-        self.refresh_token = user_input.get(CONF_REFRESH_TOKEN)
-        if self.installed_app_id is None:
-            # Launch the external setup URL
-            url = format_install_url(self.app_id, self.location_id)
-            return self.async_external_step(step_id="authorize", url=url)
-
-        next_step_id = "install"
-        if self.source == SOURCE_REAUTH:
-            next_step_id = "update"
-        return self.async_external_step_done(next_step_id=next_step_id)
-
-    def _show_step_pat(self, errors):
-        if self.access_token is None:
-            # Get the token from an existing entry to make it easier to setup multiple locations.
-            self.access_token = next(
-                (
-                    entry.data.get(CONF_ACCESS_TOKEN)
-                    for entry in self._async_current_entries()
-                ),
-                None,
-            )
+        )
 
         return self.async_show_form(
-            step_id="pat",
+            step_id="user",
+            data_schema=data_schema,
+            description_placeholders={
+                "webhook_available": "Yes" if has_webhook else "No (Manual mode required)",
+            },
+        )
+
+    async def async_step_manual_auth(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle manual authentication with installed app credentials."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            # Validate the installed app credentials
+            try:
+                installed_app_id = user_input[CONF_INSTALLED_APP_ID]
+                access_token = user_input[CONF_ACCESS_TOKEN]
+
+                api = SmartThings(async_get_clientsession(self.hass), access_token)
+
+                # Validate installed app
+                from .smartapp import validate_installed_app
+                installed_app = await validate_installed_app(api, installed_app_id)
+
+                self.location_id = installed_app.location_id
+
+                # Get location name for title
+                location = await api.location(self.location_id)
+
+                # Create entry with manual mode enabled
+                return self.async_create_entry(
+                    title=location.name,
+                    data={
+                        CONF_INSTALLED_APP_ID: installed_app_id,
+                        CONF_ACCESS_TOKEN: access_token,
+                        CONF_LOCATION_ID: self.location_id,
+                        CONF_MANUAL_MODE: True,
+                        CONF_USE_POLLING: True,
+                    },
+                )
+
+            except ClientResponseError as ex:
+                if ex.status in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
+                    errors["base"] = "invalid_access_token"
+                else:
+                    errors["base"] = "cannot_connect"
+                _LOGGER.exception("Error validating installed app")
+            except Exception as ex:
+                _LOGGER.exception("Unexpected error during manual auth")
+                errors["base"] = "unknown"
+
+        return self.async_show_form(
+            step_id="manual_auth",
             data_schema=vol.Schema(
-                {vol.Required(CONF_ACCESS_TOKEN, default=self.access_token): str}
+                {
+                    vol.Required(CONF_INSTALLED_APP_ID): str,
+                    vol.Required(CONF_ACCESS_TOKEN): str,
+                }
             ),
             errors=errors,
             description_placeholders={
-                "token_url": "https://account.smartthings.com/tokens",
-                "component_url": (
-                    "https://www.home-assistant.io/integrations/smartthings/"
+                "manual_instructions": (
+                    "1. Create a SmartThings app at https://developer.smartthings.com/\n"
+                    "2. Install the app in your SmartThings location\n"
+                    "3. Get your installed_app_id and access_token\n"
+                    "4. Enter them below"
                 ),
             },
         )
 
+    async def async_oauth_create_entry(self, data: dict[str, Any]) -> ConfigFlowResult:
+        """Create an entry for the flow, or update existing entry."""
+        token = data["token"]
+
+        # Validate token has required scopes
+        if not set(token.get("scope", "").split()) >= set(REQUESTED_SCOPES):
+            return self.async_abort(
+                reason="missing_scopes",
+                description_placeholders={"scope": ", ".join(REQUESTED_SCOPES)},
+            )
+
+        # Get installed app ID from token
+        installed_app_id = token.get(CONF_INSTALLED_APP_ID)
+        if not installed_app_id:
+            return self.async_abort(reason="missing_installed_app_id")
+
+        # Get location for this installed app
+        api = SmartThings(
+            async_get_clientsession(self.hass), token[CONF_ACCESS_TOKEN]
+        )
+
+        try:
+            installed_app = await api.installed_app(installed_app_id)
+            self.location_id = installed_app.location_id
+
+            # Check for existing entry with same location
+            await self.async_set_unique_id(
+                format_unique_id(installed_app.app_id, self.location_id)
+            )
+            self._abort_if_unique_id_configured()
+
+            # Get location name
+            location = await api.location(self.location_id)
+
+            return self.async_create_entry(
+                title=location.name,
+                data={
+                    **data,
+                    CONF_INSTALLED_APP_ID: installed_app_id,
+                    CONF_LOCATION_ID: self.location_id,
+                    CONF_MANUAL_MODE: False,
+                    CONF_USE_POLLING: False,  # Use webhook for OAuth2
+                },
+            )
+
+        except ClientResponseError as ex:
+            if ex.status in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
+                return self.async_abort(reason="oauth_error")
+            raise
+
     async def async_step_reauth(
         self, entry_data: Mapping[str, Any]
     ) -> ConfigFlowResult:
-        """Handle re-authentication of an existing config entry."""
+        """Handle reauthorization request."""
+        entry = self.hass.config_entries.async_get_entry(self.context["entry_id"])
+
+        if entry and entry.data.get(CONF_MANUAL_MODE):
+            # Manual mode reauth
+            return await self.async_step_reauth_manual()
+
+        # OAuth2 reauth
         return await self.async_step_reauth_confirm()
 
     async def async_step_reauth_confirm(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Handle re-authentication of an existing config entry."""
+        """Confirm reauth dialog."""
         if user_input is None:
             return self.async_show_form(step_id="reauth_confirm")
-        self.app_id = self._get_reauth_entry().data[CONF_APP_ID]
-        self.location_id = self._get_reauth_entry().data[CONF_LOCATION_ID]
-        self._set_confirm_only()
-        return await self.async_step_authorize()
+        return await self.async_step_user()
 
-    async def async_step_update(
+    async def async_step_reauth_manual(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Handle re-authentication of an existing config entry."""
-        return await self.async_step_update_confirm()
+        """Handle manual reauth."""
+        errors: dict[str, str] = {}
+        entry = self.hass.config_entries.async_get_entry(self.context["entry_id"])
 
-    async def async_step_update_confirm(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """Handle re-authentication of an existing config entry."""
-        if user_input is None:
-            self._set_confirm_only()
-            return self.async_show_form(step_id="update_confirm")
-        entry = self._get_reauth_entry()
-        return self.async_update_reload_and_abort(
-            entry, data_updates={CONF_REFRESH_TOKEN: self.refresh_token}
+        if user_input is not None:
+            try:
+                access_token = user_input[CONF_ACCESS_TOKEN]
+                api = SmartThings(async_get_clientsession(self.hass), access_token)
+
+                # Validate the token
+                installed_app_id = entry.data[CONF_INSTALLED_APP_ID]
+                await api.installed_app(installed_app_id)
+
+                # Update entry with new token
+                return self.async_update_reload_and_abort(
+                    entry,
+                    data_updates={CONF_ACCESS_TOKEN: access_token},
+                )
+
+            except ClientResponseError:
+                errors["base"] = "invalid_access_token"
+            except Exception:
+                _LOGGER.exception("Unexpected error during manual reauth")
+                errors["base"] = "unknown"
+
+        return self.async_show_form(
+            step_id="reauth_manual",
+            data_schema=vol.Schema({vol.Required(CONF_ACCESS_TOKEN): str}),
+            errors=errors,
         )
-
-    async def async_step_install(self, data=None):
-        """Create a config entry at completion of a flow and authorization of the app."""
-        data = {
-            CONF_ACCESS_TOKEN: self.access_token,
-            CONF_REFRESH_TOKEN: self.refresh_token,
-            CONF_CLIENT_ID: self.oauth_client_id,
-            CONF_CLIENT_SECRET: self.oauth_client_secret,
-            CONF_LOCATION_ID: self.location_id,
-            CONF_APP_ID: self.app_id,
-            CONF_INSTALLED_APP_ID: self.installed_app_id,
-        }
-
-        location = await self.api.location(data[CONF_LOCATION_ID])
-        self.location = location
-
-        return self.async_create_entry(title=location.name, data=data)
 
     @staticmethod
     @callback
-    def async_get_options_flow(config_entry):
+    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
         """Handle a option flow."""
         return OptionsFlowHandler(config_entry)
 
@@ -312,26 +286,31 @@ class SmartThingsFlowHandler(ConfigFlow, domain=DOMAIN):
 class OptionsFlowHandler(OptionsFlow):
     """Handles options flow for the component."""
 
-    def __init__(self, config_entry) -> None:
+    def __init__(self, config_entry: ConfigEntry) -> None:
         """Initialize options flow."""
-        #self.config_entry = config_entry
+        self.config_entry = config_entry
 
-    async def async_step_init(self, user_input: dict[str, Any] = None) -> dict[str, Any]:
-        errors: dict[str, str] = {}
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle options flow."""
-        options = self.config_entry.options
-
         if user_input is not None:
             return self.async_create_entry(data=user_input)
+
+        options = self.config_entry.options
 
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(
-                    {
-                        #vol.Optional(CONF_ENABLE_DEFAULT_ENTITIES, default=options.get(CONF_ENABLE_DEFAULT_ENTITIES, False)): cv.boolean,
-                        vol.Optional(CONF_ENABLE_SYNTAX_PROPERTY, default=options.get(CONF_ENABLE_SYNTAX_PROPERTY, False)): cv.boolean,
-                        vol.Optional(CONF_RESETTING_ENTITIES, default=options.get(CONF_RESETTING_ENTITIES, False)): cv.boolean,
-                    }
-            ), errors=errors
+                {
+                    vol.Optional(
+                        CONF_ENABLE_SYNTAX_PROPERTY,
+                        default=options.get(CONF_ENABLE_SYNTAX_PROPERTY, False),
+                    ): cv.boolean,
+                    vol.Optional(
+                        CONF_RESETTING_ENTITIES,
+                        default=options.get(CONF_RESETTING_ENTITIES, False),
+                    ): cv.boolean,
+                }
+            ),
         )
-        
