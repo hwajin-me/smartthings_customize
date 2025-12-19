@@ -80,31 +80,90 @@ class SmartThingsFlowHandler(
         # Check if webhook is available for automatic mode
         has_webhook = validate_webhook_requirements(self.hass)
 
+        # Check OAuth availability
+        has_cloud = "cloud" in self.hass.config.components
+        has_my = "my" in self.hass.config.components
+        has_external_url = bool(self.hass.config.external_url)
+
+        # OAuth is available if either:
+        # 1. Cloud is available (uses my.home-assistant.io)
+        # 2. external_url is configured and my integration is disabled
+        oauth_available = has_cloud or (has_external_url and not has_my)
+
         if user_input is not None:
             if user_input.get("auth_method") == "manual":
                 self.manual_mode = True
                 return await self.async_step_manual_auth()
+
+            # Check if OAuth is possible before proceeding
+            if not oauth_available:
+                return self.async_abort(
+                    reason="oauth_not_available",
+                    description_placeholders={
+                        "error": "OAuth requires either Home Assistant Cloud or external_url configuration. Please disable 'my' integration if using external_url, or use Manual authentication."
+                    }
+                )
+
             # Continue with OAuth2 flow
             return await self.async_step_pick_implementation()
+
+        # Determine OAuth status message
+        if has_cloud:
+            oauth_status = "OAuth2 (Available via Cloud)"
+        elif has_external_url and not has_my:
+            oauth_status = "OAuth2 (Available via external_url)"
+        elif has_external_url and has_my:
+            oauth_status = "OAuth2 (Unavailable: disable 'my' integration)"
+        else:
+            oauth_status = "OAuth2 (Unavailable: configure external_url)"
 
         # Show choice between OAuth2 and manual
         data_schema = vol.Schema(
             {
-                vol.Required("auth_method", default="oauth2"): vol.In(
+                vol.Required("auth_method", default="oauth2" if oauth_available else "manual"): vol.In(
                     {
-                        "oauth2": "OAuth2 (Recommended)",
+                        "oauth2": oauth_status,
                         "manual": "Manual (for restricted networks)",
                     }
                 )
             }
         )
 
+        # Prepare description placeholders
+        placeholders = {
+            "webhook_available": "Yes" if has_webhook else "No (Manual mode required)",
+        }
+
+        # Add OAuth setup instructions if not available
+        if not oauth_available:
+            if not has_external_url:
+                placeholders["oauth_help"] = (
+                    "To use OAuth2, configure external_url in configuration.yaml:\n"
+                    "homeassistant:\n"
+                    "  external_url: 'https://your-domain.com'\n"
+                    "Then register redirect URI: https://your-domain.com/auth/external/callback"
+                )
+            elif has_my:
+                placeholders["oauth_help"] = (
+                    "To use local OAuth2, disable the 'my' integration.\n"
+                    "Then register redirect URI: https://your-domain.com/auth/external/callback"
+                )
+        else:
+            if has_cloud:
+                placeholders["oauth_help"] = (
+                    "Using OAuth2 via Home Assistant Cloud.\n"
+                    "Register redirect URI: https://my.home-assistant.io/redirect/oauth"
+                )
+            else:
+                placeholders["oauth_help"] = (
+                    "Using OAuth2 via external_url.\n"
+                    f"Register redirect URI: {self.hass.config.external_url}/auth/external/callback"
+                )
+
         return self.async_show_form(
             step_id="user",
             data_schema=data_schema,
-            description_placeholders={
-                "webhook_available": "Yes" if has_webhook else "No (Manual mode required)",
-            },
+            description_placeholders=placeholders,
         )
 
     async def async_step_manual_auth(
