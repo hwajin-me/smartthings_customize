@@ -1,0 +1,20 @@
+services:
+  homeassistant-smartthings-customize:
+    container_name: homeassistant-smartthings-customize
+    image: "homeassistant/home-assistant:2025.8"
+    volumes:
+      - ./configuration.yaml:/config/configuration.yaml
+      - ../custom_components/smartthings_customize:/config/custom_components/smartthings_customize
+    restart: unless-stopped
+    privileged: true
+    environment:
+      - TZ=Asia/Seoul
+    ports:
+      - "8123:8123"
+      - "6789:6789"
+    networks:
+      - podman-default
+
+networks:
+  podman-default:
+    external: true

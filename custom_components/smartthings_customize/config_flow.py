@@ -27,6 +27,8 @@ from .const import (
     CONF_LOCATION_ID,
     CONF_MANUAL_MODE,
     CONF_USE_POLLING,
+    CONF_POLLING_INTERVAL,
+    CONF_USE_WEBHOOK,
     DOMAIN,
     REQUESTED_SCOPES,
     CONF_RESETTING_ENTITIES,
@@ -357,19 +359,48 @@ class OptionsFlowHandler(OptionsFlow):
             return self.async_create_entry(data=user_input)
 
         options = self.config_entry.options
+        data = self.config_entry.data
+
+        # Check if this is manual mode or OAuth2 mode
+        manual_mode = data.get(CONF_MANUAL_MODE, False)
+        oauth2_mode = not manual_mode and "app_id" not in data
+
+        # Build schema based on mode
+        schema_dict = {
+            vol.Optional(
+                CONF_ENABLE_SYNTAX_PROPERTY,
+                default=options.get(CONF_ENABLE_SYNTAX_PROPERTY, False),
+            ): cv.boolean,
+            vol.Optional(
+                CONF_RESETTING_ENTITIES,
+                default=options.get(CONF_RESETTING_ENTITIES, False),
+            ): cv.boolean,
+        }
+
+        # Add webhook option for OAuth2 mode
+        if oauth2_mode:
+            schema_dict[vol.Optional(
+                CONF_USE_WEBHOOK,
+                default=options.get(CONF_USE_WEBHOOK, True),
+            )] = cv.boolean
+
+        # Add polling options (for all modes)
+        schema_dict[vol.Optional(
+            CONF_USE_POLLING,
+            default=options.get(CONF_USE_POLLING, manual_mode or not oauth2_mode),
+        )] = cv.boolean
+
+        schema_dict[vol.Optional(
+            CONF_POLLING_INTERVAL,
+            default=options.get(CONF_POLLING_INTERVAL, 30),
+        )] = vol.All(vol.Coerce(int), vol.Range(min=5, max=300))
 
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema(
-                {
-                    vol.Optional(
-                        CONF_ENABLE_SYNTAX_PROPERTY,
-                        default=options.get(CONF_ENABLE_SYNTAX_PROPERTY, False),
-                    ): cv.boolean,
-                    vol.Optional(
-                        CONF_RESETTING_ENTITIES,
-                        default=options.get(CONF_RESETTING_ENTITIES, False),
-                    ): cv.boolean,
-                }
-            ),
+            data_schema=vol.Schema(schema_dict),
+            description_placeholders={
+                "mode": "OAuth2" if oauth2_mode else ("Manual" if manual_mode else "Webhook"),
+                "polling_info": "Polling interval in seconds (5-300). Lower values mean more frequent updates but higher API usage.",
+                "webhook_info": "Enable webhook for real-time updates (requires HTTPS). If disabled, polling will be used.",
+            },
         )

@@ -40,7 +40,28 @@ from .custom_api import async_get_app_info, async_remove_app_info
 import yaml
 
 from .config_flow import SmartThingsFlowHandler  # noqa: F401
-from .const import *
+from .const import (
+    CONF_ACCESS_TOKEN,
+    CONF_APP_ID,
+    CONF_CLIENT_ID,
+    CONF_CLIENT_SECRET,
+    CONF_ENABLE_SYNTAX_PROPERTY,
+    CONF_INSTALLED_APP_ID,
+    CONF_LOCATION_ID,
+    CONF_MANUAL_MODE,
+    CONF_POLLING_INTERVAL,
+    CONF_REFRESH_TOKEN,
+    CONF_RESETTING_ENTITIES,
+    CONF_USE_POLLING,
+    CONF_USE_WEBHOOK,
+    DATA_BROKERS,
+    DATA_MANAGER,
+    DOMAIN,
+    EVENT_BUTTON,
+    PLATFORMS,
+    SIGNAL_SMARTTHINGS_UPDATE,
+    TOKEN_REFRESH_INTERVAL,
+)
 from .smartapp import (
     format_unique_id,
     setup_smartapp,
@@ -67,7 +88,16 @@ ENTITY_ID_FORMAT = DOMAIN + ".{}"
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Initialize the SmartThings platform."""
-    await setup_smartapp_endpoint(hass, False)
+    # Check if any entry needs webhook (not in OAuth2-only mode)
+    # OAuth2-only entries don't have app_id and don't need webhooks
+    entries = hass.config_entries.async_entries(DOMAIN)
+    needs_webhook = any(
+        CONF_APP_ID in entry.data for entry in entries
+    )
+
+    # Only setup webhook endpoint if needed
+    if needs_webhook:
+        await setup_smartapp_endpoint(hass, False)
 
     # async def _handle_reload(service):
     #     """Handle reload service call."""
@@ -124,6 +154,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Check if manual mode or OAuth2 mode
     manual_mode = entry.data.get(CONF_MANUAL_MODE, False)
 
+    # Detect OAuth2 mode: not manual mode and no app_id (means using OAuth2 cloud auth)
+    oauth2_mode = not manual_mode and CONF_APP_ID not in entry.data
+
+    # Get options for webhook and polling
+    use_webhook = entry.options.get(CONF_USE_WEBHOOK, True)  # Default to webhook for OAuth2
+    use_polling = entry.options.get(CONF_USE_POLLING, manual_mode or not use_webhook)
+    polling_interval = entry.options.get(CONF_POLLING_INTERVAL, 30)  # Default 30 seconds
+
     # Get access token based on mode
     if manual_mode:
         # Manual mode: use access token directly
@@ -134,9 +172,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             implementation = await config_entry_oauth2_flow.async_get_config_entry_implementation(
                 hass, entry
             )
-        except ValueError as err:
-            _LOGGER.error("OAuth2 implementation not found: %s", err)
-            raise ConfigEntryNotReady from err
+        except (ValueError, KeyError) as err:
+            _LOGGER.error("OAuth2 implementation not found or auth_implementation missing: %s", err)
+            raise ConfigEntryAuthFailed from err
 
         oauth_session = config_entry_oauth2_flow.OAuth2Session(hass, entry, implementation)
 
@@ -157,13 +195,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             ),
         )
 
-    # Skip webhook validation if in manual mode
-    if not manual_mode and not validate_webhook_requirements(hass):
+    # Skip webhook validation if not using webhook
+    if use_webhook and not manual_mode and not validate_webhook_requirements(hass):
         _LOGGER.warning(
             "The 'base_url' of the 'http' integration must be configured and start with"
-            " 'https://'"
+            " 'https://'. Webhook is disabled, using polling instead."
         )
-        return False
+        use_webhook = False
+        use_polling = True
 
     api = SmartThings_custom(async_get_clientsession(hass), access_token)
 
@@ -242,8 +281,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         await asyncio.gather(*(retrieve_device_status(d) for d in devices.copy()))
 
-        # Sync device subscriptions (skip if in manual mode)
-        if not manual_mode:
+        # Sync device subscriptions (only if webhook is enabled)
+        if use_webhook and not manual_mode:
             await smartapp_sync_subscriptions(
                 hass,
                 token.access_token,
@@ -251,11 +290,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 installed_app.installed_app_id,
                 devices,
             )
-        else:
             _LOGGER.info(
-                "Manual mode enabled - skipping webhook subscriptions for app '%s'",
+                "Webhook enabled for app '%s' - device events will be pushed in real-time",
                 installed_app.installed_app_id,
             )
+        else:
+            if manual_mode:
+                _LOGGER.info(
+                    "Manual mode enabled - using polling (interval: %s seconds) for app '%s'",
+                    polling_interval,
+                    installed_app.installed_app_id,
+                )
+            else:
+                _LOGGER.info(
+                    "Webhook disabled - using API polling (interval: %s seconds) for app '%s'",
+                    polling_interval,
+                    installed_app.installed_app_id,
+                )
 
         # Setup device broker
         #broker = DeviceBroker(hass, entry, token, smart_app, devices, scenes)
@@ -264,7 +315,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             # modules when its created. In the future this should be
             # refactored to not do this.
             broker = await hass.async_add_import_executor_job(
-                DeviceBroker, hass, entry, token, smart_app, devices, scenes
+                DeviceBroker, hass, entry, token, smart_app, devices, scenes, use_polling, polling_interval, api
             )
         broker.connect()
         hass.data[DOMAIN][DATA_BROKERS][entry.entry_id] = broker
@@ -427,6 +478,9 @@ class DeviceBroker:
         smart_app,
         devices: Iterable,
         scenes: Iterable,
+        use_polling: bool = False,
+        polling_interval: int = 30,
+        api = None,
     ) -> None:
         """Create a new instance of the DeviceBroker."""
         self._hass = hass
@@ -436,6 +490,10 @@ class DeviceBroker:
         self._token = token
         self._event_disconnect = None
         self._regenerate_token_remove = None
+        self._polling_remove = None
+        self._use_polling = use_polling
+        self._polling_interval = polling_interval
+        self._api = api
         self._assignments = self._assign_capabilities(devices)
         self.devices = {device.device_id: device for device in devices}
         self.scenes = {scene.scene_id: scene for scene in scenes}
@@ -481,36 +539,101 @@ class DeviceBroker:
     def connect(self):
         """Connect handlers/listeners for device/lifecycle events."""
 
-        # Setup interval to regenerate the refresh token on a periodic basis.
-        # Tokens expire in 30 days and once expired, cannot be recovered.
-        async def regenerate_refresh_token(now):
-            """Generate a new refresh token and update the config entry."""
-            await self._token.refresh(
-                self._entry.data[CONF_CLIENT_ID],
-                self._entry.data[CONF_CLIENT_SECRET],
-            )
-            self._hass.config_entries.async_update_entry(
-                self._entry,
-                data={
-                    **self._entry.data,
-                    CONF_ACCESS_TOKEN: self._token.access_token,
-                    CONF_REFRESH_TOKEN: self._token.refresh_token,
-                },
-            )
-            for id, device in self.devices.items():
-                device.status._api._token = self._token.access_token
+        if self._use_polling:
+            # Use API polling instead of webhooks
+            from datetime import timedelta
 
-            _LOGGER.debug(
-                "Regenerated refresh token for installed app: %s",
+            async def poll_device_status(now):
+                """Poll device status from SmartThings API."""
+                try:
+                    # Get the location ID from the entry
+                    location_id = self._entry.data.get(CONF_LOCATION_ID)
+                    if not location_id:
+                        _LOGGER.error("No location_id found for polling")
+                        return
+
+                    # Fetch updated device list
+                    devices = await self._api.devices(location_ids=[location_id])
+
+                    # Update device statuses
+                    updated_devices = set()
+                    for device in devices:
+                        if device.device_id in self.devices:
+                            try:
+                                await device.status.refresh()
+                                # Copy the updated status to our device
+                                self.devices[device.device_id].status = device.status
+                                updated_devices.add(device.device_id)
+                            except Exception as err:
+                                _LOGGER.debug(
+                                    "Error refreshing status for device %s: %s",
+                                    device.device_id,
+                                    err,
+                                )
+
+                    # Send update signal if any devices were updated
+                    if updated_devices:
+                        async_dispatcher_send(
+                            self._hass,
+                            SIGNAL_SMARTTHINGS_UPDATE,
+                            updated_devices,
+                            None  # No event object in polling mode
+                        )
+                        _LOGGER.debug(
+                            "Polled and updated %s devices for app '%s'",
+                            len(updated_devices),
+                            self._installed_app_id,
+                        )
+
+                except Exception as err:
+                    _LOGGER.error(
+                        "Error polling device status for app '%s': %s",
+                        self._installed_app_id,
+                        err,
+                    )
+
+            # Poll at configured interval
+            self._polling_remove = async_track_time_interval(
+                self._hass, poll_device_status, timedelta(seconds=self._polling_interval)
+            )
+            _LOGGER.info(
+                "Started API polling (interval: %s seconds) for app '%s'",
+                self._polling_interval,
                 self._installed_app_id,
             )
+        else:
+            # Webhook mode: use traditional event-based updates
+            # Setup interval to regenerate the refresh token on a periodic basis.
+            # Tokens expire in 30 days and once expired, cannot be recovered.
+            async def regenerate_refresh_token(now):
+                """Generate a new refresh token and update the config entry."""
+                await self._token.refresh(
+                    self._entry.data[CONF_CLIENT_ID],
+                    self._entry.data[CONF_CLIENT_SECRET],
+                )
+                self._hass.config_entries.async_update_entry(
+                    self._entry,
+                    data={
+                        **self._entry.data,
+                        CONF_ACCESS_TOKEN: self._token.access_token,
+                        CONF_REFRESH_TOKEN: self._token.refresh_token,
+                    },
+                )
+                for id, device in self.devices.items():
+                    device.status._api._token = self._token.access_token
 
-        self._regenerate_token_remove = async_track_time_interval(
-            self._hass, regenerate_refresh_token, TOKEN_REFRESH_INTERVAL
-        )
+                _LOGGER.debug(
+                    "Regenerated refresh token for installed app: %s",
+                    self._installed_app_id,
+                )
 
-        # Connect handler to incoming device events
-        self._event_disconnect = self._smart_app.connect_event(self._event_handler)
+            self._regenerate_token_remove = async_track_time_interval(
+                self._hass, regenerate_refresh_token, TOKEN_REFRESH_INTERVAL
+            )
+
+            # Connect handler to incoming device events (if smart_app is available)
+            if self._smart_app:
+                self._event_disconnect = self._smart_app.connect_event(self._event_handler)
 
     def disconnect(self):
         """Disconnects handlers/listeners for device/lifecycle events."""
@@ -518,6 +641,8 @@ class DeviceBroker:
             self._regenerate_token_remove()
         if self._event_disconnect:
             self._event_disconnect()
+        if self._polling_remove:
+            self._polling_remove()
 
     def get_assigned(self, device_id: str, platform: str):
         """Get the capabilities assigned to the platform."""

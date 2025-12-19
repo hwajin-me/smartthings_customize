@@ -64,12 +64,18 @@
     "step": {
       "init": {
         "title": "SmartThings Customize Configuration",
+        "description": "Mode: {mode}\n\n{webhook_info}\n\n{polling_info}",
         "data": {
-          "enable_default_entities": "enable default entities",
-          "enable_syntax_property": "enable syntax property",
-          "resetting_entities": "resetting entities"
+          "enable_syntax_property": "Enable syntax property",
+          "resetting_entities": "Reset entities",
+          "use_webhook": "Use webhook for real-time updates",
+          "use_polling": "Use API polling",
+          "polling_interval": "Polling interval (seconds)"
         }
       }
     }
+  },
+  "application_credentials": {
+    "description": "Follow the [instructions]({more_info_url}) to create OAuth credentials for SmartThings.\n\n1. Go to SmartThings Developer Workspace\n2. Create a new app or use an existing one\n3. Set the redirect URI to: `{redirect_uri}`\n4. Copy the Client ID and Client Secret below"
   }
 }

@@ -29,6 +29,8 @@ CONF_LOCATION_ID = "location_id"
 CONF_REFRESH_TOKEN = "refresh_token"
 CONF_MANUAL_MODE = "manual_mode"
 CONF_USE_POLLING = "use_polling"
+CONF_POLLING_INTERVAL = "polling_interval"
+CONF_USE_WEBHOOK = "use_webhook"
 
 CONF_RESETTING_ENTITIES = "resetting_entities"
 #CONF_ENABLE_DEFAULT_ENTITIES = "enable_default_entities"
