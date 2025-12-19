@@ -7,7 +7,7 @@ from homeassistant.const import Platform
 DOMAIN = "smartthings_customize"
 
 APP_OAUTH_CLIENT_NAME = "HA Customize"
-APP_OAUTH_SCOPES = ["r:devices:*", "r:devices:*","w:devices:*","x:devices:*","l:devices","r:locations:*", "w:locations:*", "x:locations:*","r:scenes:*", "x:scenes:*", "r:installedapps:*", "l:installedapps", "w:installedapps"]
+APP_OAUTH_SCOPES = ["r:devices:*", "r:devices:*","w:devices:*","x:devices:*"]
 APP_NAME_PREFIX = "ha_customize."
 
 # OAuth2 Scopes for user authentication
@@ -18,16 +18,7 @@ OAUTH2_TOKEN = "https://auth-global.api.smartthings.com/oauth/token"
 REQUESTED_SCOPES = [
     "r:devices:*",
     "w:devices:*",
-    "x:devices:*",
-    "l:devices",
-    "r:locations:*",
-    "w:locations:*",
-    "x:locations:*",
-    "r:scenes:*",
-    "x:scenes:*",
-    "r:installedapps:*",
-    "l:installedapps",
-    "w:installedapps",
+    "x:devices:*"
 ]
 
 CONF_APP_ID = "app_id"
